@@ -40,6 +40,7 @@ SatelliteSimOpt = {path = "src/opt"}
 SatelliteSimOrbit = {path = "src/orbit"}
 SatelliteSimSecurity = {path = "src/security"}
 SatelliteSimTraffic = {path = "src/traffic"}
+SatelliteSimViz = {path = "src/viz"}
 
 [extensions]
 SatelliteSimVizGLMakieExt = "SatelliteSimViz"
