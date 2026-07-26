@@ -1,0 +1,46 @@
+# 可微优化环境（Phase 1）
+# = envs/core + ForwardDiff + Zygote
+# 不含: Enzyme（P3 砍掉）, Flux/Lux（PINN 未修复，移入 extras）
+# 目标: Manifest < 150 包
+
+[deps]
+Comonicon = "863f3e99-da2a-4334-8734-de3dacbe5542"
+DataStructures = "864edb3b-99cc-5e75-8d2d-829cb0a9cfe8"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+Graphs = "86223c79-3864-5bf0-83f7-82e725a168b6"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+SatelliteSimCore = "99f6b6c7-c40f-4eb3-8423-ddc96d839c0b"
+SatelliteSimFoundation = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+SatelliteSimLink = "c3d4e5f6-a7b8-9012-cdef-345678901234"
+SatelliteSimMetrics = "d4e5f6a7-b8c9-0123-efab-456789012345"
+SatelliteSimNet = "e40ae7a9-b545-48ee-92d2-18cbe9a7d82b"
+SatelliteSimOpt = "6ed3806a-63e5-4264-b3e5-1647cc02f284"
+SatelliteSimOrbit = "b2c3d4e5-f6a7-8901-bcde-f23456789012"
+SatelliteSimTraffic = "e5f6a7b8-c9d0-1234-5678-9abcdef01234"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[sources]
+SatelliteSimCore = {path = "../../src/core"}
+SatelliteSimFoundation = {path = "../../src/foundation"}
+SatelliteSimLink = {path = "../../src/link"}
+SatelliteSimMetrics = {path = "../../src/metrics"}
+SatelliteSimNet = {path = "../../src/net"}
+SatelliteSimOpt = {path = "../../src/opt"}
+SatelliteSimOrbit = {path = "../../src/orbit"}
+SatelliteSimTraffic = {path = "../../src/traffic"}
+
+[compat]
+julia = "1.12"
+ForwardDiff = "1.4.1"
+
+[extras]
+Enzyme = "7da242da-08ed-463a-9acd-ee780be4f1d9"
+Flux = "587475ba-b771-5e3f-ad9e-33799f191a9c"
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
