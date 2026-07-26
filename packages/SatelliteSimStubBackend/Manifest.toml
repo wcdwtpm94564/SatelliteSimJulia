@@ -1,0 +1,16 @@
+# This file is machine-generated - editing it directly is not advised
+
+julia_version = "1.12.6"
+manifest_format = "2.0"
+project_hash = "37168b2eb0da438b63dc8d20eb7a1b653f1f87db"
+
+[[deps.SatelliteSimBackends]]
+path = "../SatelliteSimBackends"
+uuid = "8f4bd5d1-6a1c-4d2e-9d7f-4e1c8b6a2101"
+version = "0.1.0"
+
+[[deps.SatelliteSimStubBackend]]
+deps = ["SatelliteSimBackends"]
+path = "."
+uuid = "9a5ce6e2-7b2d-4e3f-ae80-5f2d9c7b3202"
+version = "0.1.0"

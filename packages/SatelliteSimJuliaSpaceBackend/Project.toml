@@ -1,0 +1,21 @@
+name = "SatelliteSimJuliaSpaceBackend"
+uuid = "ab6df7f3-8c3e-4f40-bf91-603ead8c4303"
+version = "0.1.0"
+
+[deps]
+SatelliteSimBackends = "8f4bd5d1-6a1c-4d2e-9d7f-4e1c8b6a2101"
+SatelliteToolbox = "6ac157d9-b43d-51bb-8fab-48bf53814f4a"
+
+[sources]
+SatelliteSimBackends = {path = "../SatelliteSimBackends"}
+SatelliteSimOrbit = {path = "../../src/orbit"}
+
+[compat]
+julia = "1.12"
+
+[extras]
+SatelliteSimOrbit = "b2c3d4e5-f6a7-8901-bcde-f23456789012"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["SatelliteSimOrbit", "Test"]
