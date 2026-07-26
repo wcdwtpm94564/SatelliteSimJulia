@@ -100,14 +100,79 @@ def _assert_default_suite_contract() -> None:
         )
 
 
+def _repo_is_git_worktree() -> bool:
+    """True only when REPO_ROOT is inside a real git work tree.
+
+    Backups / `git archive` mirrors / rsync'd copies are legitimate build roots
+    but have no `.git`; `git` exits non-zero there and must not abort the run.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--is-inside-work-tree"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        # git binary missing / not executable.
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == "true"
+
+
+def _git_head_commit() -> str:
+    """Best-effort HEAD sha; never fatal (non-git build roots are supported)."""
+    if not _repo_is_git_worktree():
+        return "UNKNOWN"
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return "UNKNOWN"
+    return proc.stdout.strip() if proc.returncode == 0 else "UNKNOWN"
+
+
 def _require_clean_modal_sources() -> None:
+    """Refuse to build from uncommitted image sources -- when that is knowable.
+
+    Degrades to a warning (instead of crashing) whenever provenance simply
+    cannot be checked: no `.git`, no `git` binary, or `git status` itself
+    failing. Previously this raised CalledProcessError inside non-git backup
+    directories and the only escape hatch was ``SATSIM_ALLOW_DIRTY_MODAL_SOURCE=1``.
+    """
     if os.environ.get(ALLOW_DIRTY_ENV) == "1":
         return
-    status = subprocess.check_output(
-        ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--", *IMAGE_SOURCE_PATHS],
-        text=True,
-    )
-    dirty = [line for line in status.splitlines() if line.strip()]
+    if not _repo_is_git_worktree():
+        print(
+            f"WARNING: {REPO_ROOT} is not a git work tree (extracted backup or "
+            "git-archive mirror?); skipping the dirty-source preflight. "
+            "Image provenance is NOT verifiable for this build."
+        )
+        return
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "status", "--porcelain", "--", *IMAGE_SOURCE_PATHS],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        print(f"WARNING: cannot run git for the Modal source preflight ({exc}); skipping.")
+        return
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip().splitlines()[:2]
+        print(
+            "WARNING: `git status` failed for the Modal source preflight "
+            f"({'; '.join(detail) or f'exit {proc.returncode}'}); skipping."
+        )
+        return
+    dirty = [line for line in (proc.stdout or "").splitlines() if line.strip()]
     if dirty:
         preview = "; ".join(dirty[:6])
         raise SystemExit(
@@ -119,37 +184,96 @@ def _require_clean_modal_sources() -> None:
 
 _assert_default_suite_contract()
 
+# ---------------------------------------------------------------------------
+# Image layer order (reworked 2026-07-26).
+#
+# Modal/Docker layers are cached strictly in order: the first layer whose inputs
+# changed invalidates every layer after it. The previous build put all seven
+# `add_local_dir(copy=True)` calls BEFORE `Pkg.instantiate` + CUDA precompile,
+# so editing a single character of Julia source invalidated the CUDA
+# precompilation layers and forced a full rebuild (~10-20 min). Measured upload
+# is only ~3.2 MB / 0.7 s, i.e. transfer was never the bottleneck -- rebuild was.
+#
+# New order, slowest-and-most-stable first:
+#   L1  base CUDA.jl registry image (immutable digest pin)
+#   L2  layout scaffolding: /opt/packages symlink (no local inputs)
+#   L3  dependency manifests ONLY (Project/Manifest/LocalPreferences x2)
+#   L4  Pkg.instantiate + Pkg.add(CUDA, SatelliteToolboxSgp4)   <-- expensive
+#   L5  CUDA_Runtime_jll preference inheritance
+#   L6  Pkg.precompile() (full CUDA precompile)                 <-- expensive
+#   L7  early image contract check (CUDA importable offline)
+#   L8  env snapshot: freeze the resolved Project/Manifest/LocalPreferences
+#   L9  TLE data file
+#   L10 local sources: SatelliteSimBackends -> src/* -> SatelliteSimGPU
+#   L11 restore env snapshot + cheap re-precompile + contract re-check
+#
+# L3..L8 are keyed only on the dependency manifests, so they stay cached across
+# ordinary source edits; only L9..L11 rerun, and L11 recompiles just the two
+# path-dev packages (seconds) because CUDA's cache is untouched.
+# ---------------------------------------------------------------------------
+
+# The only local inputs Pkg needs to resolve/instantiate the GPU environment.
+# Kept as an explicit allowlist so no source file can sneak into the cached
+# dependency layer. (LocalPreferences/Manifest entries are optional by design.)
+DEP_MANIFEST_FILES: list[tuple[Path, str]] = [
+    (PACKAGE_DIR / "Project.toml", f"{REMOTE_PACKAGE_DIR}/Project.toml"),
+    (PACKAGE_DIR / "Manifest.toml", f"{REMOTE_PACKAGE_DIR}/Manifest.toml"),
+    (PACKAGE_DIR / "LocalPreferences.toml", f"{REMOTE_PACKAGE_DIR}/LocalPreferences.toml"),
+    # SatelliteSimGPU/Project.toml declares
+    #   [sources] SatelliteSimBackends = {path = "../SatelliteSimBackends"}
+    # so instantiate resolves through the sibling package's Project.toml.
+    (BACKENDS_DIR / "Project.toml", f"{REMOTE_BACKENDS_DIR}/Project.toml"),
+    (BACKENDS_DIR / "Manifest.toml", f"{REMOTE_BACKENDS_DIR}/Manifest.toml"),
+]
+# Resolved environment is frozen here before local sources are copied in, then
+# restored afterwards. Required for correctness: `add_local_dir(PACKAGE_DIR)`
+# now runs AFTER `Pkg.add`, so it would otherwise overwrite the augmented
+# Project/Manifest (dropping CUDA + SatelliteToolboxSgp4) and clobber the
+# inherited CUDA_Runtime_jll preference with the checked-in placeholder.
+ENV_SNAPSHOT_DIR = "/opt/.satsim-env-snapshot"
+
+# --- L1/L2: base image + layout scaffolding (no local inputs) --------------
 image_builder = (
     modal.Image.from_registry(
         "ghcr.io/juliagpu/cuda.jl@sha256:8c40fadfbeea933b98e81a1b164cc3ccb8d442c6caf9e3285e4b577d30d5dd13",
         add_python="3.12",
     )
     .entrypoint([])
-    .add_local_dir(BACKENDS_DIR, REMOTE_BACKENDS_DIR, copy=True)
-    .add_local_dir(PACKAGE_DIR, REMOTE_PACKAGE_DIR, copy=True)
-    .add_local_file(str(TLE_LOCAL), TLE_REMOTE, copy=True)
+    .run_commands(
+        # Match src/*/Project.toml [sources] path ../../packages/SatelliteSimBackends.
+        # A dangling symlink here is fine; L10 materialises the target.
+        f"mkdir -p /opt/packages {SRC_REMOTE} {REMOTE_PACKAGE_DIR} {REMOTE_BACKENDS_DIR} "
+        f"&& ln -sfn {REMOTE_BACKENDS_DIR} /opt/packages/SatelliteSimBackends",
+    )
 )
 
-for _pkg in OPT_SRC_PACKAGES:
-    image_builder = image_builder.add_local_dir(
-        str(REPO_ROOT / "src" / _pkg),
-        f"{SRC_REMOTE}/{_pkg}",
-        copy=True,
-        # Parallel workers may edit test/; keep only loadable package content.
-        ignore=["**/test/**", "**/.DS_Store", "**/__pycache__/**"],
-    )
+# --- L3: dependency manifests only -----------------------------------------
+for _dep_local, _dep_remote in DEP_MANIFEST_FILES:
+    if not _dep_local.exists():
+        print(f"NOTE: dependency manifest {_dep_local} absent; not baked into the image.")
+        continue
+    image_builder = image_builder.add_local_file(str(_dep_local), _dep_remote, copy=True)
 
-image = image_builder.run_commands(
-    # Match src/*/Project.toml [sources] path ../../packages/SatelliteSimBackends
-    "mkdir -p /opt/packages && ln -sfn /opt/SatelliteSimBackends /opt/packages/SatelliteSimBackends",
-    "julia --project=/opt/SatelliteSimGPU -e '"
+# --- L4..L8: everything expensive, keyed only on the manifests above -------
+image_builder = image_builder.run_commands(
+    # Both path-dev packages must be *loadable shells* for Pkg to resolve and
+    # precompile the environment; their real sources arrive in L10. Stubs are
+    # overwritten there and Julia re-precompiles them by content hash, which is
+    # cheap (SatelliteSimBackends has zero deps, SatelliteSimGPU only light ones).
+    f"mkdir -p {REMOTE_BACKENDS_DIR}/src {REMOTE_PACKAGE_DIR}/src "
+    f"&& printf 'module SatelliteSimBackends\\nend\\n' "
+    f"> {REMOTE_BACKENDS_DIR}/src/SatelliteSimBackends.jl "
+    f"&& printf 'module SatelliteSimGPU\\nend\\n' "
+    f"> {REMOTE_PACKAGE_DIR}/src/SatelliteSimGPU.jl",
+    # Resolve + download only. Auto-precompile is disabled so the stub modules
+    # are never the thing that decides whether this layer succeeds.
+    "JULIA_PKG_PRECOMPILE_AUTO=0 julia --project=/opt/SatelliteSimGPU -e '"
     "using Pkg; "
     "Pkg.instantiate(); "
-    # CUDA is not a SatelliteSimGPU Project.toml dep (CPU KA tests stay light), "
+    # CUDA is not a SatelliteSimGPU Project.toml dep (CPU KA tests stay light),
     # but modal_gpu_runner.jl needs it on A10G. Pin to runner EXPECTED_CUDA_JL_VERSION.
     "Pkg.add(name=\"CUDA\", version=\"6.2.1\"); "
-    "Pkg.add(\"SatelliteToolboxSgp4\"); "
-    "Pkg.precompile()'",
+    "Pkg.add(\"SatelliteToolboxSgp4\")'",
     # A freshly Pkg.add-ed CUDA in this project does NOT inherit the base image's
     # CUDA runtime-version preference (it lives only in the base default depot env),
     # so CUDA.functional() is false on the A10G ("could not find an appropriate CUDA
@@ -171,18 +295,87 @@ image = image_builder.run_commands(
     "proj[\"CUDA_Runtime_jll\"] = cfg; "
     "open(dst, \"w\") do io; TOML.print(io, proj); end; "
     "println(\"COPIED_CUDA_RT_PREF from=\" * src * \" cfg=\" * string(cfg))'",
+    # The expensive one: full CUDA.jl precompile. Cached as long as the
+    # dependency manifests (L3) and the inherited preference are unchanged.
     "julia --project=/opt/SatelliteSimGPU -e 'using Pkg; Pkg.precompile()'",
     # Lock the image contract: under the runner's exact offline + narrow load path,
     # CUDA (pinned) and SatelliteToolboxSgp4 must both import. Fails the build early
-    # (before spawning GPU containers) if the load path is too narrow to see CUDA.
+    # (before uploading sources or spawning GPU containers) if the load path is too
+    # narrow to see CUDA.
     "JULIA_PKG_OFFLINE=true JULIA_LOAD_PATH=@:@stdlib "
     "julia --project=/opt/SatelliteSimGPU -e '"
     "using CUDA, SatelliteToolboxSgp4; "
     "pkgversion(CUDA) == v\"6.2.1\" || "
     "error(\"image CUDA \" * string(pkgversion(CUDA)) * \" != 6.2.1\"); "
     "println(\"IMAGE_CUDA_OK cuda=\" * string(pkgversion(CUDA)))'",
+    # Freeze the resolved environment so L11 can restore it byte-identically.
+    # Byte-identical restore is what keeps the CUDA precompile cache valid.
+    f"mkdir -p {ENV_SNAPSHOT_DIR} && "
+    f"cp {REMOTE_PACKAGE_DIR}/Project.toml {REMOTE_PACKAGE_DIR}/Manifest.toml "
+    f"{ENV_SNAPSHOT_DIR}/ && "
+    f"if [ -f {REMOTE_PACKAGE_DIR}/LocalPreferences.toml ]; then "
+    f"cp {REMOTE_PACKAGE_DIR}/LocalPreferences.toml {ENV_SNAPSHOT_DIR}/; fi && "
+    f"ls -l {ENV_SNAPSHOT_DIR}",
     # Opt deps are large (Enzyme/Zygote/Lux). Instantiate at runtime in opt_load_check
     # so image builds stay short and avoid races with parallel src/opt editors.
+)
+
+# --- L9: TLE data (refreshed occasionally, not per-edit) -------------------
+image_builder = image_builder.add_local_file(str(TLE_LOCAL), TLE_REMOTE, copy=True)
+
+# --- L10: local sources, least- to most-frequently edited ------------------
+image_builder = image_builder.add_local_dir(
+    BACKENDS_DIR,
+    REMOTE_BACKENDS_DIR,
+    copy=True,
+    ignore=["**/.DS_Store", "**/__pycache__/**"],
+)
+
+for _pkg in OPT_SRC_PACKAGES:
+    image_builder = image_builder.add_local_dir(
+        str(REPO_ROOT / "src" / _pkg),
+        f"{SRC_REMOTE}/{_pkg}",
+        copy=True,
+        # Parallel workers may edit test/; keep only loadable package content.
+        ignore=["**/test/**", "**/.DS_Store", "**/__pycache__/**"],
+    )
+
+# Hottest input last: modal_gpu_runner.jl + src/ live here.
+image_builder = image_builder.add_local_dir(
+    PACKAGE_DIR,
+    REMOTE_PACKAGE_DIR,
+    copy=True,
+    # Ignore churn that would invalidate this layer without changing the build.
+    ignore=["**/.DS_Store", "**/__pycache__/**", "*.bak-*", "**/*.bak-*"],
+)
+
+# --- L11: restore resolved env, compile the real sources, re-verify --------
+image = image_builder.run_commands(
+    # add_local_dir(PACKAGE_DIR) just overwrote Project/Manifest/LocalPreferences
+    # with the checked-in copies, which do NOT contain CUDA / SatelliteToolboxSgp4
+    # and carry only a placeholder CUDA_Runtime_jll. Put the resolved ones back.
+    f"cp {ENV_SNAPSHOT_DIR}/Project.toml {ENV_SNAPSHOT_DIR}/Manifest.toml "
+    f"{REMOTE_PACKAGE_DIR}/ && "
+    f"if [ -f {ENV_SNAPSHOT_DIR}/LocalPreferences.toml ]; then "
+    f"cp {ENV_SNAPSHOT_DIR}/LocalPreferences.toml "
+    f"{REMOTE_PACKAGE_DIR}/LocalPreferences.toml; fi",
+    # Cheap: only SatelliteSimBackends + SatelliteSimGPU changed content hash.
+    # CUDA and friends are already cached from L6 and are not recompiled.
+    "julia --project=/opt/SatelliteSimGPU -e 'using Pkg; Pkg.precompile()'",
+    # Re-assert the contract against the *final* image state, and prove the real
+    # SatelliteSimGPU (not the L4 stub) is what loads.
+    "JULIA_PKG_OFFLINE=true JULIA_LOAD_PATH=@:@stdlib "
+    "julia --project=/opt/SatelliteSimGPU -e '"
+    "using CUDA, SatelliteToolboxSgp4, SatelliteSimGPU, SatelliteSimBackends; "
+    "pkgversion(CUDA) == v\"6.2.1\" || "
+    "error(\"image CUDA \" * string(pkgversion(CUDA)) * \" != 6.2.1\"); "
+    # A real symbol from each path-dev package: proves the L4 stubs were
+    # replaced by the copied sources and recompiled, not silently reused.
+    "isdefined(SatelliteSimGPU, :coverage_loss_gpu) || "
+    "error(\"SatelliteSimGPU still resolves to the build stub\"); "
+    "isdefined(SatelliteSimBackends, :AbstractOrbitBackend) || "
+    "error(\"SatelliteSimBackends still resolves to the build stub\"); "
+    "println(\"IMAGE_CUDA_OK cuda=\" * string(pkgversion(CUDA)))'",
 )
 
 app = modal.App("satellitesim-gpu-validation")
@@ -561,12 +754,8 @@ def main(suites: str = "parallel") -> None:
         return
     if key == "stable":
         # One Modal app: ≤1×A10G + 1×CPU-16. Opt/GPU package under test = git HEAD.
-        commit = (
-            subprocess.check_output(
-                ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
-                text=True,
-            ).strip()
-        )
+        # Best-effort: non-git build roots report UNKNOWN instead of crashing.
+        commit = _git_head_commit()
         print(
             f"Submitting STABLE validation (commit={commit}): "
             "1×CPU-16 + 1×A10G in one app"
